@@ -1,5 +1,8 @@
-
 import pandas as pd
+import json
+import boto3
+import io
+from datetime import datetime, timezone
 
 def flatten_records(data):  
     rows = []
@@ -52,3 +55,45 @@ def flatten_records(data):
 
     df = pd.DataFrame(rows)
     return df
+
+def lambda_handler(event, context):
+    # get bucket and key from s3 event
+    bucket = event['Records'][0]['s3']['bucket']['name']
+    key = event['Records'][0]['s3']['object']['key']
+
+    s3 = boto3.client('s3')
+    glue = boto3.client('glue')
+
+    # read json from S3
+    resp = s3.get_object(Bucket=bucket, Key=key)
+    content = resp['Body'].read().decode('utf-8')
+    data = json.loads(content)
+
+    df = flatten_records(data)
+
+    # make parquet
+    parquet_buffer = io.BytesIO()
+    df.to_parquet(parquet_buffer, index=False, engine='pyarrow', compression='snappy')
+
+    # timestamped key for output
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y%m%d_%H%M%S")
+    output_key = f"processed/parquet/airport_delays_{ts}.parquet"
+
+    s3.put_object(Bucket=bucket, Key=output_key, Body=parquet_buffer.getvalue())
+
+    # trigger glue crawler (opt)
+    crawler_name = ""
+    try:
+        glue.start_crawler(Name=crawler_name)
+    except Exception as e:
+        print(f"!! Could not start crawler {crawler_name}: {e}")
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": "Success",
+            "records_processed": len(df),
+            "output_key": output_key
+        })
+    }
