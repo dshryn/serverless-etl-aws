@@ -1,4 +1,3 @@
-# lambda_function.py
 import json
 import boto3
 import io
@@ -10,10 +9,12 @@ import traceback
 S3 = boto3.client("s3")
 GLUE = boto3.client("glue")
 
+# env
 GLUE_DATABASE = os.environ.get("GLUE_DATABASE", "airport_db")
 GLUE_TABLE = os.environ.get("GLUE_TABLE", "airport_delays_parquet")
 PROCESSED_PREFIX = os.environ.get("PROCESSED_PREFIX", "processed/parquet/")
 PARTITION_KEYS = [{"Name": "year", "Type": "int"}, {"Name": "month", "Type": "int"}]
+
 
 def flatten_records(data):
     rows = []
@@ -27,7 +28,6 @@ def flatten_records(data):
         flights = stats.get("Flights", {}) or {}
         minutes = stats.get("Minutes Delayed", {}) or {}
 
-        # numeric to ints if possible else None
         def to_int(v):
             try:
                 return int(v) if v is not None else None
@@ -69,16 +69,18 @@ def flatten_records(data):
             "minutes_weather": to_int(minutes.get("Weather")),
         }
         rows.append(row)
-    df = pd.DataFrame(rows)
-    return df
 
+    return pd.DataFrame(rows)
+
+
+# glue
 def ensure_glue_table(bucket_name, table_location_s3):
-
     try:
         GLUE.get_table(DatabaseName=GLUE_DATABASE, Name=GLUE_TABLE)
+        print(f"Glue table {GLUE_TABLE} already exists.")
         return
     except GLUE.exceptions.EntityNotFoundException:
-        pass
+        print(f"Creating Glue table {GLUE_TABLE}...")
 
     sd = {
         "Columns": [
@@ -111,8 +113,7 @@ def ensure_glue_table(bucket_name, table_location_s3):
         "SerdeInfo": {
             "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
             "Parameters": {}
-        },
-        "Parameters": {}
+        }
     }
 
     table_input = {
@@ -127,23 +128,21 @@ def ensure_glue_table(bucket_name, table_location_s3):
     GLUE.create_table(DatabaseName=GLUE_DATABASE, TableInput=table_input)
     print(f"Created Glue table {GLUE_TABLE} in DB {GLUE_DATABASE}")
 
+
 def partition_exists(db, table, values):
     try:
-        resp = GLUE.get_partition(DatabaseName=db, TableName=table, PartitionValues=values)
+        GLUE.get_partition(DatabaseName=db, TableName=table, PartitionValues=values)
         return True
     except GLUE.exceptions.EntityNotFoundException:
         return False
     except Exception as e:
-        
         print("partition_exists check error:", e)
-
-        # other errors, attempt to create and batch_create_partition raises if needed
         return False
 
-def register_partition_safe(bucket_name, year, month, partition_s3_prefix):
 
-    # register partition if missing
+def register_partition_safe(bucket_name, year, month, partition_s3_prefix):
     partition_values = [str(int(year)), str(int(month))]
+
     if partition_exists(GLUE_DATABASE, GLUE_TABLE, partition_values):
         print(f"Partition {partition_values} already exists. Skipping registration.")
         return
@@ -151,17 +150,15 @@ def register_partition_safe(bucket_name, year, month, partition_s3_prefix):
     partition_input = {
         "Values": partition_values,
         "StorageDescriptor": {
-            "Columns": [],  # glue will take from table
+            "Columns": [],
             "Location": partition_s3_prefix,
             "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
             "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
             "SerdeInfo": {
                 "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
                 "Parameters": {}
-            },
-            "Parameters": {}
-        },
-        "Parameters": {}
+            }
+        }
     }
 
     try:
@@ -172,61 +169,58 @@ def register_partition_safe(bucket_name, year, month, partition_s3_prefix):
         )
         print(f"Registered partition {partition_values} -> {partition_s3_prefix}")
     except Exception as e:
-        # partition created concurrently, ignore
         print("Error creating partition (may already exist):", e)
 
-def handler(event, context):
+
+
+def lambda_handler(event, context):
     try:
-        record = event['Records'][0]
-        bucket = record['s3']['bucket']['name']
-        key = record['s3']['object']['key']
+        record = event["Records"][0]
+        bucket = record["s3"]["bucket"]["name"]
+        key = record["s3"]["object"]["key"]
 
+        # file from s3
         obj = S3.get_object(Bucket=bucket, Key=key)
-        raw = obj['Body'].read().decode("utf-8")
+        raw = obj["Body"].read().decode("utf-8")
 
-        # parse
+        # parse json
         try:
             data = json.loads(raw)
             if isinstance(data, dict):
                 data = [data]
         except Exception:
-            # fallback
             lines = [l for l in raw.splitlines() if l.strip()]
             data = [json.loads(l) for l in lines]
 
         df = flatten_records(data)
 
         if df.empty:
+            print("No records found in JSON file.")
             return {"statusCode": 200, "body": json.dumps({"message": "No records to process"})}
 
-        # validate that year/month exist for each row
         valid = df.dropna(subset=["year", "month"])
         if valid.empty:
-            return {"statusCode": 400, "body": json.dumps({"message": "No valid year/month partitions in data"})}
+            print("No valid partitions found (missing year/month).")
+            return {"statusCode": 400, "body": json.dumps({"message": "No valid year/month in data"})}
 
-        # ensure glue table exists (root loc)
         table_location_s3 = f"s3://{bucket}/{PROCESSED_PREFIX}"
         ensure_glue_table(bucket, table_location_s3)
 
         results = []
-        # group by partition year, month and write separate parquet for each
         grouped = valid.groupby(["year", "month"])
+
         for (year, month), group in grouped:
-            # create parquet buffer
             parquet_buffer = io.BytesIO()
-            group = group.drop(columns=[])
             group.to_parquet(parquet_buffer, index=False, engine="pyarrow", compression="snappy")
 
             partition_prefix = f"{PROCESSED_PREFIX}year={int(year):04d}/month={int(month):02d}/"
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
             out_key = f"{partition_prefix}airport_delays_{ts}.parquet"
 
-            # upload parquet to s3
             S3.put_object(Bucket=bucket, Key=out_key, Body=parquet_buffer.getvalue())
             s3_path = f"s3://{bucket}/{out_key}"
-            print(f"Wrote parquet to {s3_path}")
+            print(f"Wrote Parquet: {s3_path}")
 
-            # register partition pointing to folder
             partition_s3_prefix = f"s3://{bucket}/{partition_prefix}"
             register_partition_safe(bucket, year, month, partition_s3_prefix)
 
@@ -238,5 +232,6 @@ def handler(event, context):
         }
 
     except Exception as e:
+        print("Lambda failed:", e)
         traceback.print_exc()
         return {"statusCode": 500, "body": json.dumps({"message": "Error", "error": str(e)})}
